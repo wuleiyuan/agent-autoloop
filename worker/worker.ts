@@ -39,6 +39,8 @@ const REPAIRS = 2;
 const KEEP_DAYS = 14;
 const WAIT = 50;
 const PAUSE = 30_000;
+/** How many times one round asks before it decides the hub is really gone. */
+const POLL_TRIES = 3;
 const UNREACHABLE = 10 * 60_000;
 const TELL_TRIES = 5;
 /** Enough of a long output to find what's at either end of it, while it runs. */
@@ -475,6 +477,24 @@ export function createWorker({
     }
   }
 
+  /**
+   * One round of asking the hub for work. A lost long poll is retried a few times with the same claim — the protocol
+   * says a lost answer comes back on that claim — before the round gives up. The retries are short polls, so a
+   * connection that hangs can't stall the whole round, and a momentary network blip doesn't cost a 30s pause.
+   */
+  async function poll(query: Parameters<WorkerHub["work"]>[0]) {
+    let last: unknown;
+    for (let attempt = 0; attempt < POLL_TRIES; attempt++) {
+      try {
+        return await hub.work(attempt === 0 ? query : { ...query, wait: 0 });
+      } catch (error) {
+        last = error;
+        log(`long poll lost, trying again: ${error}`);
+      }
+    }
+    throw last;
+  }
+
   /** One round: look at what's in hand, hand in what's ended, come for more. Whether the hub could be reached. */
   async function tick() {
     for (const entry of entries()) await check(entry);
@@ -482,7 +502,7 @@ export function createWorker({
     const held = entries();
     let reachable = true;
     try {
-      const answer = await hub.work({
+      const answer = await poll({
         claim,
         wait: held.length ? 1 : wait,
         running: held.map((entry) => entry.run),

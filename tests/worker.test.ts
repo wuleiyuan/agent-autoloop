@@ -15,6 +15,7 @@
 // A shell replacing itself with the final move must not lose its identity before the exit file is published.
 // A failed or timed-out receipt repair must preserve the original business outcome; cancellation must reap a child
 // ignoring SIGTERM even after restart; adding usage must not turn a missing price into a reported zero.
+// A single flaky long poll is taken for the hub being gone, sleeping the worker and starting an outage alarm.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -98,11 +99,18 @@ function fakeHub() {
     results: [] as any[],
     starts: [] as any[],
     claims: [] as any[],
+    workAttempts: [] as any[],
     failResults: 0,
+    failWork: 0,
     refuseResults: false,
     down: false,
     async work(query: any) {
+      hub.workAttempts.push(query);
       if (hub.down) throw new Error("connect ECONNREFUSED");
+      if (hub.failWork > 0) {
+        hub.failWork -= 1;
+        throw new Error("connect ECONNRESET");
+      }
       hub.claims.push(query);
       const cancel = hub.cancel;
       hub.cancel = [];
@@ -634,6 +642,47 @@ test("the hub gone for ten minutes is told once, tried a few times if telling fa
   clock += 11 * 60_000;
   for (let i = 0; i < 8; i++) await f.tick();
   assert.equal(readFileSync(attempts, "utf8").trim().split("\n").length, 5);
+});
+
+test("one lost long poll is tried again with the same claim and never counted as the hub being gone", async () => {
+  const hub = fakeHub();
+  hub.failWork = 1; // one network blip, then the hub answers
+  let clock = Date.now();
+  const told = join(folder, "flaky-told.txt");
+  const lines: string[] = [];
+  const w = worker(hub, {
+    wait: 50,
+    now: () => clock,
+    log: (line: string) => lines.push(line),
+    unreachable: ["/bin/sh", "-c", `echo "$0" >> ${told}`, "{text}"],
+  });
+
+  assert.equal(await w.tick(), true, "a blip is not an outage: the worker keeps going without a 30s pause");
+  assert.equal(hub.claims.length, 1, "the poll got through in the same round");
+  assert.equal(hub.workAttempts.length, 2, "one failed call, then one retry");
+  assert.equal(
+    hub.workAttempts[0].claim,
+    hub.workAttempts[1].claim,
+    "the retry keeps the claim, so it gets the same job back",
+  );
+  assert.equal(hub.workAttempts[1].wait, 0, "the retry is a short poll, so a hung connection can't stall the round");
+  assert.ok(
+    !lines.some((line) => line.includes("couldn't reach the hub")),
+    "a blip that recovered isn't logged as an outage",
+  );
+
+  clock += 11 * 60_000;
+  await w.tick();
+  assert.ok(!existsSync(told), "a recovered blip never starts the ten-minute alarm");
+});
+
+test("a hub that stays down is still called unreachable, after a bounded number of tries", async () => {
+  const hub = fakeHub();
+  hub.down = true;
+  const w = worker(hub, { wait: 50, now: () => Date.now() });
+  assert.equal(await w.tick(), false);
+  assert.ok(hub.workAttempts.length >= 2 && hub.workAttempts.length <= 4, "a few quick retries, not an endless loop");
+  assert.equal(new Set(hub.workAttempts.map((query) => query.claim)).size, 1, "all tries kept the same claim");
 });
 
 // An adapter that says what its script prints.
